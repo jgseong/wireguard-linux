@@ -47,6 +47,7 @@
   */
 
 #include <linux/linkage.h>
+#include <asm/cache.h>
 
 	.text
 	.fpu		neon
@@ -205,8 +206,9 @@ ENDPROC(hchacha_block_neon)
 
 	.align		5
 ENTRY(chacha_4block_xor_neon)
-	push		{r4-r5}
-	mov		r4, sp			// preserve the stack pointer
+	push		{r4-r6, lr}
+	ldr		r4, [sp, #16]
+	mov		r6, sp			// preserve the stack pointer
 	sub		ip, sp, #0x20		// allocate a 32 byte buffer
 	bic		ip, ip, #0x1f		// aligned to 32 bytes
 	mov		sp, ip
@@ -215,6 +217,7 @@ ENTRY(chacha_4block_xor_neon)
 	// r1: 4 data blocks output, o
 	// r2: 4 data blocks input, i
 	// r3: nrounds
+	// r4: number of bytes
 
 	//
 	// This function encrypts four consecutive ChaCha blocks by loading
@@ -503,6 +506,13 @@ ENTRY(chacha_4block_xor_neon)
 	vswp		d17, d20
 	vswp		d19, d22
 
+	mov		sp, r6		// restore original stack pointer
+
+	subs		r4, r4, #96	// set up lr and ip for overlapping
+	mov		lr, #32		// loads and stores
+	addcc		ip, r4, #32
+	movcs		ip, #32
+
 	// Last two rows of each block are (q8 q12) (q10 q14) (q9 q13) (q11 q15)
 
 	// x8..11[0-3] += s8..11[0-3]	(add orig state to 3rd row of each block)
@@ -519,42 +529,122 @@ ENTRY(chacha_4block_xor_neon)
 
 	// XOR the rest of the data with the keystream
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], ip
 	veor		q0, q0, q8
 	veor		q1, q1, q12
-	vst1.8		{q0-q1}, [r1]!
+	ble		.Lle96
+	subs		r4, r4, #32
+	addcc		lr, r4, #32
+	vst1.8		{q0-q1}, [r1], ip
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], lr
 	veor		q0, q0, q2
 	veor		q1, q1, q6
-	vst1.8		{q0-q1}, [r1]!
+	ble		.Lle128
+	subs		r4, r4, #32
+	addcc		ip, r4, #32
+	vst1.8		{q0-q1}, [r1], lr
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], ip
 	veor		q0, q0, q10
 	veor		q1, q1, q14
-	vst1.8		{q0-q1}, [r1]!
+	ble		.Lle160
+	subs		r4, r4, #32
+	addcc		lr, r4, #32
+	vst1.8		{q0-q1}, [r1], ip
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], lr
 	veor		q0, q0, q4
 	veor		q1, q1, q5
-	vst1.8		{q0-q1}, [r1]!
+	ble		.Lle192
+	subs		r4, r4, #32
+	addcc		ip, r4, #32
+	vst1.8		{q0-q1}, [r1], lr
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], ip
 	veor		q0, q0, q9
 	veor		q1, q1, q13
-	vst1.8		{q0-q1}, [r1]!
+	ble		.Lle224
+	subs		r4, r4, #32
+	addcc		lr, r4, #32
+	vst1.8		{q0-q1}, [r1], ip
 
-	vld1.8		{q0-q1}, [r2]!
+	vld1.8		{q0-q1}, [r2], lr
 	veor		q0, q0, q3
 	veor		q1, q1, q7
-	vst1.8		{q0-q1}, [r1]!
+	blt		.Llt256
+	vst1.8		{q0-q1}, [r1], lr
 
+.Llastblock:
 	vld1.8		{q0-q1}, [r2]
-	  mov		sp, r4		// restore original stack pointer
 	veor		q0, q0, q11
 	veor		q1, q1, q15
 	vst1.8		{q0-q1}, [r1]
 
-	pop		{r4-r5}
-	bx		lr
+	pop		{r4-r6, pc}
+
+.Lle192:
+	mov		ip, lr
+	vmov		q4, q9
+	vmov		q5, q13
+
+.Lle160:
+	// Process the final block if processing less than 4 full blocks.
+	// Entered with 32 bytes of ChaCha cipher stream in q4-q5, and the
+	// previous 32 byte output block that still needs to be written at [r1]
+	beq		.Lfullblock
+	adr		lr, .Lpermute
+	add		lr, lr, ip
+	add		ip, ip, r1
+
+	vld1.8		{q2-q3}, [lr]
+	vld1.8		{q6-q7}, [r2]
+
+	vtbl.8		d4, {q4-q5}, d4
+	vtbl.8		d5, {q4-q5}, d5
+	vtbl.8		d6, {q4-q5}, d6
+	vtbl.8		d7, {q4-q5}, d7
+
+	veor		q6, q6, q2
+	veor		q7, q7, q3
+
+	vst1.8		{q6-q7}, [ip]	// overlapping stores
+	vst1.8		{q0-q1}, [r1]
+	pop		{r4-r6, pc}
+
+.Lfullblock:
+	vst1.8		{q0-q1}, [r1]!
+	vmov		q11, q4
+	vmov		q15, q5
+	b		.Llastblock
+
+.Lle96:
+	vmov		q4, q2
+	vmov		q5, q6
+	b		.Lle160
+.Lle128:
+	mov		ip, lr
+	vmov		q4, q10
+	vmov		q5, q14
+	b		.Lle160
+.Lle224:
+	vmov		q4, q3
+	vmov		q5, q7
+	b		.Lle160
+.Llt256:
+	mov		ip, lr
+	vmov		q4, q11
+	vmov		q5, q15
+	b		.Lle160
 ENDPROC(chacha_4block_xor_neon)
+
+	.align		L1_CACHE_SHIFT
+.Lpermute:
+	.byte		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+	.byte		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+	.byte		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+	.byte		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+	.byte		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+	.byte		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+	.byte		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+	.byte		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
